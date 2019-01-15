@@ -458,6 +458,8 @@ envoy_cc_test(
         "//test/common/upstream:utility_lib",
         "//test/config:utility_lib",
         "//test/test_common:network_utility_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
         "@envoy_api//envoy/api/v2:eds_cc",
         "@envoy_api//envoy/service/discovery/v2:hds_cc",
     ],

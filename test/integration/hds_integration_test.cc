@@ -16,6 +16,8 @@
 #include "test/config/utility.h"
 #include "test/integration/http_integration.h"
 #include "test/test_common/network_utility.h"
+#include "test/test_common/logging.h"
+#include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -73,6 +75,7 @@ public:
 
   // Envoy sends health check messages to the endpoints
   void healthcheckEndpoints(std::string cluster2 = "") {
+    ENVOY_LOG_MISC(info, "healthcheckEndpoints");
     ASSERT_TRUE(host_upstream_->waitForHttpConnection(*dispatcher_, host_fake_connection_));
     ASSERT_TRUE(host_fake_connection_->waitForNewStream(*dispatcher_, host_stream_));
     ASSERT_TRUE(host_stream_->waitForEndStream(*dispatcher_));
@@ -191,6 +194,23 @@ public:
       return false;
     }
     return true;
+  }
+
+  bool checkEndpointsHealthResponse(envoy::service::discovery::v2::EndpointHealthResponse response,
+                                    envoy::api::v2::core::HealthStatus expected_status,
+                                    Network::Address::InstanceConstSharedPtr address) {
+    for (auto endpoint_health : response.endpoints_health()) {
+      if (address->ip()->addressAsString() !=
+              absl::string_view(endpoint_health.endpoint().address().socket_address().address()) ||
+          address->ip()->port() !=
+              endpoint_health.endpoint().address().socket_address().port_value()) {
+        continue;
+      }
+
+      return expected_status == endpoint_health.health_status();
+    }
+
+    return false;
   }
 
   // Checks if the cluster counters are correct
@@ -590,12 +610,12 @@ TEST_P(HdsIntegrationTest, TwoEndpointsDifferentClusters) {
 
   // Receive updates until the one we expect arrives
   ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
-  while (!(checkEndpointHealthResponse(response_.endpoint_health_response().endpoints_health(0),
-                                       envoy::api::v2::core::HealthStatus::UNHEALTHY,
-                                       host_upstream_->localAddress()) &&
-           checkEndpointHealthResponse(response_.endpoint_health_response().endpoints_health(1),
-                                       envoy::api::v2::core::HealthStatus::HEALTHY,
-                                       host2_upstream_->localAddress()))) {
+  while (!(checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                        envoy::api::v2::core::HealthStatus::UNHEALTHY,
+                                        host_upstream_->localAddress()) &&
+           checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                        envoy::api::v2::core::HealthStatus::HEALTHY,
+                                        host2_upstream_->localAddress()))) {
     ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
   }
 
@@ -676,11 +696,150 @@ TEST_P(HdsIntegrationTest, TestUpdateMessage) {
 
   // Receive updates until the one we expect arrives
   ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
-  while (!checkEndpointHealthResponse(response_.endpoint_health_response().endpoints_health(0),
-                                      envoy::api::v2::core::HealthStatus::UNHEALTHY,
-                                      host2_upstream_->localAddress())) {
+  while (!checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                       envoy::api::v2::core::HealthStatus::UNHEALTHY,
+                                       host2_upstream_->localAddress())) {
     ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
   }
+
+  // Clean up connections
+  cleanupHostConnections();
+  cleanupHdsConnection();
+}
+
+// Tests Envoy HTTP health checking a single endpoint, receiving an update message
+// from the management server and health checking a new endpoint in the same cluster
+TEST_P(HdsIntegrationTest, TestAddEndpointInPlace) {
+  initialize();
+
+  // 1: Create a cluster with a single endpoint and healthcheck it
+  server_health_check_specifier_ = makeHttpHealthCheckSpecifier();
+
+  // Server <--> Envoy
+  waitForHdsStream();
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, envoy_msg_));
+
+  // Server asks for health checking
+  hds_stream_->startGrpcStream();
+  hds_stream_->sendGrpcMessage(server_health_check_specifier_);
+  test_server_->waitForCounterGe("hds_delegate.requests", ++hds_requests_);
+
+  // Envoy sends health check messages to two endpoints
+  healthcheckEndpoints();
+
+  // Endpoints respond to the health checks
+  host_stream_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  host_stream_->encodeData(1024, true);
+
+  // Receive updates until the one we expect arrives
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+  while (!checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                       envoy::api::v2::core::HealthStatus::HEALTHY,
+                                       host_upstream_->localAddress())) {
+    ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+  }
+
+  // Add another endpoint to the cluster and ensure the previous endpoint is not reset
+  auto* cluster_health_check = server_health_check_specifier_.mutable_cluster_health_checks(0);
+  auto* locality_endpoints = cluster_health_check->mutable_locality_endpoints(0);
+  Network::Utility::addressToProtobufAddress(
+      *host2_upstream_->localAddress(), *locality_endpoints->add_endpoints()->mutable_address());
+
+  // Server <--> Envoy
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, envoy_msg_));
+
+  // Server asks for health checking
+  hds_stream_->sendGrpcMessage(server_health_check_specifier_);
+  test_server_->waitForCounterGe("hds_delegate.requests", ++hds_requests_);
+
+  // Envoy sends health check messages to the new endpoint
+  ASSERT_TRUE(host2_upstream_->waitForHttpConnection(*dispatcher_, host2_fake_connection_));
+  ASSERT_TRUE(host2_fake_connection_->waitForNewStream(*dispatcher_, host2_stream_));
+  ASSERT_TRUE(host2_stream_->waitForEndStream(*dispatcher_));
+  host2_upstream_->set_allow_unexpected_disconnects(true);
+  host2_stream_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  host2_stream_->encodeData(1024, true);
+
+  // Receive updates until host 2 becomes healthy ensuring 1 never stops being healthy
+  do {
+    ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+    ASSERT_TRUE(checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                             envoy::api::v2::core::HealthStatus::HEALTHY,
+                                             host_upstream_->localAddress()));
+  } while (!checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                         envoy::api::v2::core::HealthStatus::HEALTHY,
+                                         host2_upstream_->localAddress()));
+
+  // Clean up connections
+  cleanupHostConnections();
+  cleanupHdsConnection();
+}
+
+// Tests Envoy HTTP health checking a single endpoint, receiving an update message
+// from the management server and health checking a new endpoint in the same cluster
+TEST_P(HdsIntegrationTest, TestRemoveEndpointInPlace) {
+  initialize();
+
+  // Create a cluster with a single endpoint and healthcheck it
+  server_health_check_specifier_ = makeHttpHealthCheckSpecifier();
+  auto* cluster_health_check = server_health_check_specifier_.mutable_cluster_health_checks(0);
+  auto* locality_endpoints = cluster_health_check->mutable_locality_endpoints(0);
+  Network::Utility::addressToProtobufAddress(
+      *host2_upstream_->localAddress(), *locality_endpoints->add_endpoints()->mutable_address());
+
+  // Server <--> Envoy
+  waitForHdsStream();
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, envoy_msg_));
+
+  // Server asks for health checking
+  hds_stream_->startGrpcStream();
+  hds_stream_->sendGrpcMessage(server_health_check_specifier_);
+  test_server_->waitForCounterGe("hds_delegate.requests", ++hds_requests_);
+
+  // Envoy sends health check messages to two endpoints
+  healthcheckEndpoints();
+
+  // Endpoints respond to the health checks
+  host_stream_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  host_stream_->encodeData(1024, true);
+
+  ASSERT_TRUE(host2_upstream_->waitForHttpConnection(*dispatcher_, host2_fake_connection_));
+  ASSERT_TRUE(host2_fake_connection_->waitForNewStream(*dispatcher_, host2_stream_));
+  ASSERT_TRUE(host2_stream_->waitForEndStream(*dispatcher_));
+  host2_upstream_->set_allow_unexpected_disconnects(true);
+  host2_stream_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  host2_stream_->encodeData(1024, true);
+
+  // Receive updates until the one we expect arrives
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+  while (!(checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                        envoy::api::v2::core::HealthStatus::HEALTHY,
+                                        host_upstream_->localAddress()) &&
+           checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                        envoy::api::v2::core::HealthStatus::HEALTHY,
+                                        host2_upstream_->localAddress()))) {
+    ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+  }
+
+  // Remove the second endpoint
+  *locality_endpoints->mutable_endpoints()->remove_last();
+
+  // Server <--> Envoy
+  ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, envoy_msg_));
+
+  // Server asks for health checking
+  hds_stream_->sendGrpcMessage(server_health_check_specifier_);
+  test_server_->waitForCounterGe("hds_delegate.requests", ++hds_requests_);
+
+  // Receive only the first host and have it remain as healthy
+  do {
+    ASSERT_TRUE(hds_stream_->waitForGrpcMessage(*dispatcher_, response_));
+    ASSERT_TRUE(checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                             envoy::api::v2::core::HealthStatus::HEALTHY,
+                                             host_upstream_->localAddress()));
+  } while (!checkEndpointsHealthResponse(response_.endpoint_health_response(),
+                                         envoy::api::v2::core::HealthStatus::HEALTHY,
+                                         host2_upstream_->localAddress()));
 
   // Clean up connections
   cleanupHostConnections();

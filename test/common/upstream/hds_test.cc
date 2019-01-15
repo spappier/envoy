@@ -173,8 +173,10 @@ TEST_F(HdsTest, TestProcessMessageEndpoints) {
   // Check Correctness
   for (int i = 0; i < 2; i++) {
     for (int j = 0; j < 3; j++) {
-      auto& host =
-          hds_delegate_->hdsClusters()[i]->prioritySet().hostSetsPerPriority()[0]->hosts()[j];
+      auto& host = hds_delegate_->hdsClusters()["anna" + std::to_string(i)]
+                       ->prioritySet()
+                       .hostSetsPerPriority()[0]
+                       ->hosts()[j];
       EXPECT_EQ(host->address()->ip()->addressAsString(), "127.0.0." + std::to_string(i));
       EXPECT_EQ(host->address()->ip()->port(), 1234 + j);
     }
@@ -215,8 +217,94 @@ TEST_F(HdsTest, TestProcessMessageHealthChecks) {
   hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
 
   // Check Correctness
-  EXPECT_EQ(hds_delegate_->hdsClusters()[0]->healthCheckers().size(), 2);
-  EXPECT_EQ(hds_delegate_->hdsClusters()[1]->healthCheckers().size(), 3);
+  EXPECT_EQ(hds_delegate_->hdsClusters()["minkowski0"]->healthCheckers().size(), 2);
+  EXPECT_EQ(hds_delegate_->hdsClusters()["minkowski1"]->healthCheckers().size(), 3);
+}
+
+// Test if processMessage processes endpoints from a HealthCheckSpecifier
+// message correctly
+TEST_F(HdsTest, TestProcessSecondMessage) {
+  EXPECT_CALL(*async_client_, start(_, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessage(_, _));
+  createHdsDelegate();
+
+  // Create Message
+  // - Cluster "anna0" with 3 endpoints
+  // - Cluster "anna1" with 3 endpoints
+  message = std::make_unique<envoy::service::discovery::v2::HealthCheckSpecifier>();
+  message->mutable_interval()->set_seconds(1);
+
+  for (int i = 0; i < 2; i++) {
+    auto* health_check = message->add_cluster_health_checks();
+    health_check->set_cluster_name("anna" + std::to_string(i));
+    for (int j = 0; j < 3; j++) {
+      auto* address = health_check->add_locality_endpoints()->add_endpoints()->mutable_address();
+      address->mutable_socket_address()->set_address("127.0.0." + std::to_string(i));
+      address->mutable_socket_address()->set_port_value(1234 + j);
+    }
+  }
+
+  // Process message
+  EXPECT_CALL(test_factory_, createClusterInfo(_)).Times(2);
+  hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
+
+  // Check Correctness
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 3; j++) {
+      auto& host = hds_delegate_->hdsClusters()["anna" + std::to_string(i)]
+                       ->prioritySet()
+                       .hostSetsPerPriority()[0]
+                       ->hosts()[j];
+      EXPECT_EQ(host->address()->ip()->addressAsString(), "127.0.0." + std::to_string(i));
+      EXPECT_EQ(host->address()->ip()->port(), 1234 + j);
+    }
+  }
+
+  // Process message
+  // EXPECT_CALL(test_factory_, createClusterInfo(_)).Times(2);
+  hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
+
+  // Check Correctness
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 3; j++) {
+      auto& host = hds_delegate_->hdsClusters()["anna" + std::to_string(i)]
+                       ->prioritySet()
+                       .hostSetsPerPriority()[0]
+                       ->hosts()[j];
+      EXPECT_EQ(host->address()->ip()->addressAsString(), "127.0.0." + std::to_string(i));
+      EXPECT_EQ(host->address()->ip()->port(), 1234 + j);
+    }
+  }
+
+  // Add a host
+  auto* cluster_health_check = message->mutable_cluster_health_checks(0);
+  auto* locality_endpoints = cluster_health_check->mutable_locality_endpoints(0);
+  auto* address = locality_endpoints->add_endpoints()->mutable_address();
+  address->mutable_socket_address()->set_address("127.0.0.7");
+  address->mutable_socket_address()->set_port_value(12347);
+
+  // Process message
+  // EXPECT_CALL(test_factory_, createClusterInfo(_)).Times(2);
+  hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
+
+  // Check Correctness
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 3; j++) {
+      auto& host = hds_delegate_->hdsClusters()["anna" + std::to_string(i)]
+                       ->prioritySet()
+                       .hostSetsPerPriority()[0]
+                       ->hosts()[j];
+      EXPECT_EQ(host->address()->ip()->addressAsString(), "127.0.0." + std::to_string(i));
+      EXPECT_EQ(host->address()->ip()->port(), 1234 + j);
+    }
+  }
+
+  // Check new endpoint
+  auto& host =
+      hds_delegate_->hdsClusters()["anna0"]->prioritySet().hostSetsPerPriority()[0]->hosts()[3];
+  EXPECT_EQ(host->address()->ip()->addressAsString(), "127.0.0.7");
+  EXPECT_EQ(host->address()->ip()->port(), 12347);
+  EXPECT_EQ(host->health(), Host::Health::Healthy);
 }
 
 // Tests OnReceiveMessage given a minimal HealthCheckSpecifier message
