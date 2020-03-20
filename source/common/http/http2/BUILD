@@ -15,6 +15,8 @@ envoy_cc_library(
     external_deps = [
         "nghttp2",
         "abseil_optional",
+        "abseil_inlined_vector",
+        "abseil_algorithm",
     ],
     deps = [
         ":metadata_decoder_lib",
@@ -40,6 +42,38 @@ envoy_cc_library(
         "//source/common/http:header_map_lib",
         "//source/common/http:headers_lib",
         "//source/common/http:utility_lib",
+        "//source/common/runtime:runtime_lib",
+    ],
+)
+
+# Separate library for some nghttp2 setup stuff to avoid having tests take a
+# dependency on everything in codec_lib.
+envoy_cc_library(
+    name = "nghttp2_lib",
+    srcs = ["nghttp2.cc"],
+    hdrs = ["nghttp2.h"],
+    external_deps = ["nghttp2"],
+    deps = [
+        "//source/common/common:minimal_logger_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "conn_pool_legacy_lib",
+    srcs = ["conn_pool_legacy.cc"],
+    hdrs = ["conn_pool_legacy.h"],
+    deps = [
+        "//include/envoy/event:dispatcher_interface",
+        "//include/envoy/event:timer_interface",
+        "//include/envoy/http:conn_pool_interface",
+        "//include/envoy/network:connection_interface",
+        "//include/envoy/stats:timespan_interface",
+        "//include/envoy/upstream:upstream_interface",
+        "//source/common/http:codec_client_lib",
+        "//source/common/http:conn_pool_base_legacy_lib",
+        "//source/common/network:utility_lib",
+        "//source/common/stats:timespan_lib",
+        "//source/common/upstream:upstream_lib",
     ],
 )
 
@@ -48,16 +82,11 @@ envoy_cc_library(
     srcs = ["conn_pool.cc"],
     hdrs = ["conn_pool.h"],
     deps = [
+        ":conn_pool_legacy_lib",
         "//include/envoy/event:dispatcher_interface",
-        "//include/envoy/event:timer_interface",
-        "//include/envoy/http:conn_pool_interface",
-        "//include/envoy/network:connection_interface",
-        "//include/envoy/stats:timespan",
         "//include/envoy/upstream:upstream_interface",
         "//source/common/http:codec_client_lib",
         "//source/common/http:conn_pool_base_lib",
-        "//source/common/network:utility_lib",
-        "//source/common/upstream:upstream_lib",
     ],
 )
 
@@ -73,7 +102,6 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
-        "//source/common/common:stack_array",
     ],
 )
 
@@ -89,6 +117,5 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
-        "//source/common/common:stack_array",
     ],
 )

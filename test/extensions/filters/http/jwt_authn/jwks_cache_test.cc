@@ -1,6 +1,8 @@
 #include <chrono>
 #include <thread>
 
+#include "envoy/extensions/filters/http/jwt_authn/v3/config.pb.h"
+
 #include "common/protobuf/utility.h"
 #include "common/stats/isolated_store_impl.h"
 
@@ -10,7 +12,7 @@
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
 
-using ::envoy::config::filter::http::jwt_authn::v2alpha::JwtAuthentication;
+using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
 using ::google::jwt_verify::Status;
 
 namespace Envoy {
@@ -23,7 +25,7 @@ class JwksCacheTest : public testing::Test {
 protected:
   JwksCacheTest() : api_(Api::createApiForTest()) {}
   void SetUp() override {
-    MessageUtil::loadFromYaml(ExampleConfig, config_);
+    TestUtility::loadFromYaml(ExampleConfig, config_);
     cache_ = JwksCache::create(config_, time_system_, *api_);
     jwks_ = google::jwt_verify::Jwks::createFrom(PublicKey, google::jwt_verify::Jwks::JWKS);
   }

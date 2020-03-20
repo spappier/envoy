@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/router/router.h"
 
 #include "common/network/utility.h"
@@ -17,7 +18,6 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
-using testing::_;
 using testing::NiceMock;
 using testing::Return;
 
@@ -46,7 +46,7 @@ public:
   }
 
   // Run all tests against both priority 0 and priority 1 host sets, to ensure
-  // all the load balancers have equivalent functonality for failover host sets.
+  // all the load balancers have equivalent functionality for failover host sets.
   MockHostSet& hostSet() { return GetParam() ? host_set_ : failover_host_set_; }
 
   NiceMock<MockPrioritySet> priority_set_;
@@ -55,15 +55,15 @@ public:
   std::shared_ptr<MockClusterInfo> info_{new NiceMock<MockClusterInfo>()};
   Stats::IsolatedStoreImpl stats_store_;
   ClusterStats stats_;
-  absl::optional<envoy::api::v2::Cluster::RingHashLbConfig> config_;
-  envoy::api::v2::Cluster::CommonLbConfig common_config_;
+  absl::optional<envoy::config::cluster::v3::Cluster::RingHashLbConfig> config_;
+  envoy::config::cluster::v3::Cluster::CommonLbConfig common_config_;
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Runtime::MockRandomGenerator> random_;
   std::unique_ptr<RingHashLoadBalancer> lb_;
 };
 
 // For tests which don't need to be run in both primary and failover modes.
-typedef RingHashLoadBalancerTest RingHashFailoverTest;
+using RingHashFailoverTest = RingHashLoadBalancerTest;
 
 INSTANTIATE_TEST_SUITE_P(RingHashPrimaryOrFailover, RingHashLoadBalancerTest,
                          ::testing::Values(true, false));
@@ -77,7 +77,7 @@ TEST_P(RingHashLoadBalancerTest, NoHost) {
 
 // Given minimum_ring_size > maximum_ring_size, expect an exception.
 TEST_P(RingHashLoadBalancerTest, BadRingSizeBounds) {
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(20);
   config_.value().mutable_maximum_ring_size()->set_value(10);
   EXPECT_THROW_WITH_MESSAGE(init(), EnvoyException,
@@ -92,7 +92,7 @@ TEST_P(RingHashLoadBalancerTest, Basic) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(12);
 
   init();
@@ -147,13 +147,7 @@ TEST_P(RingHashLoadBalancerTest, Basic) {
   lb = lb_->factory()->create();
   {
     TestLoadBalancerContext context(0);
-    if (GetParam() == 1) {
-      EXPECT_EQ(hostSet().hosts_[4], lb->chooseHost(&context));
-    } else {
-      // When all hosts are unhealthy, the default behavior of the load balancer is to send
-      // traffic to P=0. In this case, P=0 has no backends so it returns nullptr.
-      EXPECT_EQ(nullptr, lb->chooseHost(&context));
-    }
+    EXPECT_EQ(hostSet().hosts_[4], lb->chooseHost(&context));
   }
   EXPECT_EQ(1UL, stats_.lb_healthy_panic_.value());
 }
@@ -164,7 +158,7 @@ TEST_P(RingHashFailoverTest, BasicFailover) {
   failover_host_set_.healthy_hosts_ = {makeTestHost(info_, "tcp://127.0.0.1:82")};
   failover_host_set_.hosts_ = failover_host_set_.healthy_hosts_;
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(12);
   init();
   EXPECT_EQ(12, lb_->stats().size_.value());
@@ -198,64 +192,6 @@ TEST_P(RingHashFailoverTest, BasicFailover) {
   EXPECT_EQ(failover_host_set_.healthy_hosts_[0], lb->chooseHost(nullptr));
 }
 
-#if __GLIBCXX__ >= 20130411 && __GLIBCXX__ <= 20180726
-// Run similar tests with the default hash algorithm for GCC 5.
-// TODO(danielhochman): After v1 is deprecated this test can be deleted since std::hash will no
-// longer be in use.
-TEST_P(RingHashLoadBalancerTest, BasicWithStdHash) {
-  hostSet().hosts_ = {
-      makeTestHost(info_, "tcp://127.0.0.1:80"), makeTestHost(info_, "tcp://127.0.0.1:81"),
-      makeTestHost(info_, "tcp://127.0.0.1:82"), makeTestHost(info_, "tcp://127.0.0.1:83"),
-      makeTestHost(info_, "tcp://127.0.0.1:84"), makeTestHost(info_, "tcp://127.0.0.1:85")};
-  hostSet().healthy_hosts_ = hostSet().hosts_;
-  hostSet().runCallbacks({}, {});
-
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
-  config_.value().mutable_deprecated_v1()->mutable_use_std_hash()->set_value(true);
-  config_.value().mutable_minimum_ring_size()->set_value(12);
-  init();
-  EXPECT_EQ(12, lb_->stats().size_.value());
-  EXPECT_EQ(2, lb_->stats().min_hashes_per_host_.value());
-  EXPECT_EQ(2, lb_->stats().max_hashes_per_host_.value());
-
-  // This is the hash ring built using the default hash (probably murmur2) on GCC 5.4.
-  // ring hash: host=127.0.0.1:85 hash=1358027074129602068
-  // ring hash: host=127.0.0.1:83 hash=4361834613929391114
-  // ring hash: host=127.0.0.1:84 hash=7224494972555149682
-  // ring hash: host=127.0.0.1:81 hash=7701421856454313576
-  // ring hash: host=127.0.0.1:82 hash=8649315368077433379
-  // ring hash: host=127.0.0.1:84 hash=8739448859063030639
-  // ring hash: host=127.0.0.1:81 hash=9887544217113020895
-  // ring hash: host=127.0.0.1:82 hash=10150910876324007731
-  // ring hash: host=127.0.0.1:83 hash=15168472011420622455
-  // ring hash: host=127.0.0.1:80 hash=15427156902705414897
-  // ring hash: host=127.0.0.1:85 hash=16375050414328759093
-  // ring hash: host=127.0.0.1:80 hash=17613279263364193813
-  LoadBalancerPtr lb = lb_->factory()->create();
-  {
-    TestLoadBalancerContext context(0);
-    EXPECT_EQ(hostSet().hosts_[5], lb->chooseHost(&context));
-  }
-  {
-    TestLoadBalancerContext context(std::numeric_limits<uint64_t>::max());
-    EXPECT_EQ(hostSet().hosts_[5], lb->chooseHost(&context));
-  }
-  {
-    TestLoadBalancerContext context(1358027074129602068);
-    EXPECT_EQ(hostSet().hosts_[5], lb->chooseHost(&context));
-  }
-  {
-    TestLoadBalancerContext context(1358027074129602069);
-    EXPECT_EQ(hostSet().hosts_[3], lb->chooseHost(&context));
-  }
-  {
-    EXPECT_CALL(random_, random()).WillOnce(Return(10150910876324007730UL));
-    EXPECT_EQ(hostSet().hosts_[2], lb->chooseHost(nullptr));
-  }
-  EXPECT_EQ(0UL, stats_.lb_healthy_panic_.value());
-}
-#endif
-
 // Expect reasonable results with Murmur2 hash.
 TEST_P(RingHashLoadBalancerTest, BasicWithMurmur2) {
   hostSet().hosts_ = {
@@ -265,9 +201,9 @@ TEST_P(RingHashLoadBalancerTest, BasicWithMurmur2) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
-  config_.value().set_hash_function(envoy::api::v2::Cluster_RingHashLbConfig_HashFunction::
-                                        Cluster_RingHashLbConfig_HashFunction_MURMUR_HASH_2);
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
+  config_.value().set_hash_function(
+      envoy::config::cluster::v3::Cluster::RingHashLbConfig::MURMUR_HASH_2);
   config_.value().mutable_minimum_ring_size()->set_value(12);
   init();
   EXPECT_EQ(12, lb_->stats().size_.value());
@@ -318,7 +254,7 @@ TEST_P(RingHashLoadBalancerTest, UnevenHosts) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(3);
   init();
   EXPECT_EQ(4, lb_->stats().size_.value());
@@ -369,7 +305,7 @@ TEST_P(RingHashLoadBalancerTest, HostWeightedTinyRing) {
   hostSet().runCallbacks({}, {});
 
   // enforce a ring size of exactly six entries
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(6);
   config_.value().mutable_maximum_ring_size()->set_value(6);
   init();
@@ -397,7 +333,7 @@ TEST_P(RingHashLoadBalancerTest, HostWeightedLargeRing) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(6144);
   init();
   EXPECT_EQ(6144, lb_->stats().size_.value());
@@ -447,7 +383,7 @@ TEST_P(RingHashLoadBalancerTest, LocalityWeightedTinyRing) {
   hostSet().runCallbacks({}, {});
 
   // enforce a ring size of exactly six entries
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(6);
   config_.value().mutable_maximum_ring_size()->set_value(6);
   init();
@@ -480,7 +416,7 @@ TEST_P(RingHashLoadBalancerTest, LocalityWeightedLargeRing) {
   hostSet().locality_weights_ = makeLocalityWeights({1, 2, 3, 0});
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(6144);
   init();
   EXPECT_EQ(6144, lb_->stats().size_.value());
@@ -517,7 +453,7 @@ TEST_P(RingHashLoadBalancerTest, HostAndLocalityWeightedTinyRing) {
   hostSet().runCallbacks({}, {});
 
   // enforce a ring size of exactly 9 entries
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(9);
   config_.value().mutable_maximum_ring_size()->set_value(9);
   init();
@@ -553,7 +489,7 @@ TEST_P(RingHashLoadBalancerTest, HostAndLocalityWeightedLargeRing) {
   hostSet().locality_weights_ = makeLocalityWeights({1, 2});
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(9216);
   init();
   EXPECT_EQ(9216, lb_->stats().size_.value());
@@ -584,7 +520,7 @@ TEST_P(RingHashLoadBalancerTest, SmallFractionalScale) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(2);
   config_.value().mutable_maximum_ring_size()->set_value(2);
   init();
@@ -624,7 +560,7 @@ TEST_P(RingHashLoadBalancerTest, LargeFractionalScale) {
   hostSet().healthy_hosts_ = hostSet().hosts_;
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(1023);
   config_.value().mutable_maximum_ring_size()->set_value(1023);
   init();
@@ -661,7 +597,7 @@ TEST_P(RingHashLoadBalancerTest, LopsidedWeightSmallScale) {
   hostSet().locality_weights_ = makeLocalityWeights({127, 1});
   hostSet().runCallbacks({}, {});
 
-  config_ = envoy::api::v2::Cluster::RingHashLbConfig();
+  config_ = envoy::config::cluster::v3::Cluster::RingHashLbConfig();
   config_.value().mutable_minimum_ring_size()->set_value(1024);
   config_.value().mutable_maximum_ring_size()->set_value(1024);
   init();

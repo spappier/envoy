@@ -1,3 +1,4 @@
+#include "envoy/config/overload/v3/overload.pb.h"
 #include "envoy/server/resource_monitor.h"
 #include "envoy/server/resource_monitor_config.h"
 
@@ -8,6 +9,7 @@
 #include "extensions/resource_monitors/common/factory_base.h"
 
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/utility.h"
@@ -53,20 +55,26 @@ private:
   Event::Dispatcher& dispatcher_;
 };
 
-class FakeResourceMonitorFactory
-    : public Extensions::ResourceMonitors::Common::EmptyConfigFactoryBase {
+class FakeResourceMonitorFactory : public Server::Configuration::ResourceMonitorFactory {
 public:
-  FakeResourceMonitorFactory(const std::string& name)
-      : EmptyConfigFactoryBase(name), monitor_(nullptr) {}
+  FakeResourceMonitorFactory(const std::string& name) : monitor_(nullptr), name_(name) {}
 
-  ResourceMonitorPtr createEmptyConfigResourceMonitor(
-      Server::Configuration::ResourceMonitorFactoryContext& context) override {
+  Server::ResourceMonitorPtr
+  createResourceMonitor(const Protobuf::Message&,
+                        Server::Configuration::ResourceMonitorFactoryContext& context) override {
     auto monitor = std::make_unique<FakeResourceMonitor>(context.dispatcher());
     monitor_ = monitor.get();
-    return std::move(monitor);
+    return monitor;
   }
 
+  ProtobufTypes::MessagePtr createEmptyConfigProto() override {
+    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+  }
+
+  std::string name() const override { return name_; }
+
   FakeResourceMonitor* monitor_; // not owned
+  const std::string name_;
 };
 
 class OverloadManagerImplTest : public testing::Test {
@@ -84,8 +92,8 @@ protected:
     }));
   }
 
-  envoy::config::overload::v2alpha::OverloadManager parseConfig(const std::string& config) {
-    envoy::config::overload::v2alpha::OverloadManager proto;
+  envoy::config::overload::v3::OverloadManager parseConfig(const std::string& config) {
+    envoy::config::overload::v3::OverloadManager proto;
     bool success = Protobuf::TextFormat::ParseFromString(config, &proto);
     ASSERT(success);
     return proto;
@@ -122,7 +130,7 @@ protected:
 
   std::unique_ptr<OverloadManagerImpl> createOverloadManager(const std::string& config) {
     return std::make_unique<OverloadManagerImpl>(dispatcher_, stats_, thread_local_,
-                                                 parseConfig(config), *api_);
+                                                 parseConfig(config), validation_visitor_, *api_);
   }
 
   FakeResourceMonitorFactory factory1_;
@@ -134,6 +142,7 @@ protected:
   Stats::IsolatedStoreImpl stats_;
   NiceMock<ThreadLocal::MockInstance> thread_local_;
   Event::TimerCb timer_cb_;
+  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
   Api::ApiPtr api_;
 };
 
@@ -152,11 +161,14 @@ TEST_F(OverloadManagerImplTest, CallbackOnlyFiresWhenStateChanges) {
                              [&](OverloadActionState) { EXPECT_TRUE(false); });
   manager->start();
 
-  Stats::Gauge& active_gauge = stats_.gauge("overload.envoy.overload_actions.dummy_action.active");
+  Stats::Gauge& active_gauge = stats_.gauge("overload.envoy.overload_actions.dummy_action.active",
+                                            Stats::Gauge::ImportMode::Accumulate);
   Stats::Gauge& pressure_gauge1 =
-      stats_.gauge("overload.envoy.resource_monitors.fake_resource1.pressure");
+      stats_.gauge("overload.envoy.resource_monitors.fake_resource1.pressure",
+                   Stats::Gauge::ImportMode::NeverImport);
   Stats::Gauge& pressure_gauge2 =
-      stats_.gauge("overload.envoy.resource_monitors.fake_resource2.pressure");
+      stats_.gauge("overload.envoy.resource_monitors.fake_resource2.pressure",
+                   Stats::Gauge::ImportMode::NeverImport);
   const OverloadActionState& action_state =
       manager->getThreadLocalOverloadState().getState("envoy.overload_actions.dummy_action");
 

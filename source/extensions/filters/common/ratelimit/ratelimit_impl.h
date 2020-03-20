@@ -5,17 +5,18 @@
 #include <string>
 #include <vector>
 
-#include "envoy/config/bootstrap/v2/bootstrap.pb.h"
+#include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/grpc/async_client.h"
 #include "envoy/grpc/async_client_manager.h"
 #include "envoy/ratelimit/ratelimit.h"
 #include "envoy/server/filter_config.h"
-#include "envoy/service/ratelimit/v2/rls.pb.h"
+#include "envoy/service/ratelimit/v3/rls.pb.h"
 #include "envoy/stats/scope.h"
 #include "envoy/tracing/http_tracer.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/common/logger.h"
+#include "common/grpc/typed_async_client.h"
 #include "common/singleton/const_singleton.h"
 
 #include "extensions/filters/common/ratelimit/ratelimit.h"
@@ -26,8 +27,8 @@ namespace Filters {
 namespace Common {
 namespace RateLimit {
 
-typedef Grpc::TypedAsyncRequestCallbacks<envoy::service::ratelimit::v2::RateLimitResponse>
-    RateLimitAsyncCallbacks;
+using RateLimitAsyncCallbacks =
+    Grpc::AsyncRequestCallbacks<envoy::service::ratelimit::v3::RateLimitResponse>;
 
 struct ConstantValues {
   const std::string TraceStatus = "ratelimit_status";
@@ -35,7 +36,7 @@ struct ConstantValues {
   const std::string TraceOk = "ok";
 };
 
-typedef ConstSingleton<ConstantValues> Constants;
+using Constants = ConstSingleton<ConstantValues>;
 
 // TODO(htuch): We should have only one client per thread, but today we create one per filter stack.
 // This will require support for more than one outstanding request per client (limit() assumes only
@@ -44,11 +45,11 @@ class GrpcClientImpl : public Client,
                        public RateLimitAsyncCallbacks,
                        public Logger::Loggable<Logger::Id::config> {
 public:
-  GrpcClientImpl(Grpc::AsyncClientPtr&& async_client,
+  GrpcClientImpl(Grpc::RawAsyncClientPtr&& async_client,
                  const absl::optional<std::chrono::milliseconds>& timeout);
-  ~GrpcClientImpl();
+  ~GrpcClientImpl() override;
 
-  static void createRequest(envoy::service::ratelimit::v2::RateLimitRequest& request,
+  static void createRequest(envoy::service::ratelimit::v3::RateLimitRequest& request,
                             const std::string& domain,
                             const std::vector<Envoy::RateLimit::Descriptor>& descriptors);
 
@@ -59,15 +60,17 @@ public:
              Tracing::Span& parent_span) override;
 
   // Grpc::AsyncRequestCallbacks
-  void onCreateInitialMetadata(Http::HeaderMap&) override {}
-  void onSuccess(std::unique_ptr<envoy::service::ratelimit::v2::RateLimitResponse>&& response,
+  void onCreateInitialMetadata(Http::RequestHeaderMap&) override {}
+  void onSuccess(std::unique_ptr<envoy::service::ratelimit::v3::RateLimitResponse>&& response,
                  Tracing::Span& span) override;
   void onFailure(Grpc::Status::GrpcStatus status, const std::string& message,
                  Tracing::Span& span) override;
 
 private:
   const Protobuf::MethodDescriptor& service_method_;
-  Grpc::AsyncClientPtr async_client_;
+  Grpc::AsyncClient<envoy::service::ratelimit::v3::RateLimitRequest,
+                    envoy::service::ratelimit::v3::RateLimitResponse>
+      async_client_;
   Grpc::AsyncRequest* request_{};
   absl::optional<std::chrono::milliseconds> timeout_;
   RequestCallbacks* callbacks_{};
@@ -77,7 +80,7 @@ private:
  * Builds the rate limit client.
  */
 ClientPtr rateLimitClient(Server::Configuration::FactoryContext& context,
-                          const envoy::api::v2::core::GrpcService& grpc_service,
+                          const envoy::config::core::v3::GrpcService& grpc_service,
                           const std::chrono::milliseconds timeout);
 
 } // namespace RateLimit

@@ -1,5 +1,8 @@
-#include "envoy/api/v2/core/base.pb.h"
+#include "envoy/service/auth/v2alpha/external_auth.pb.h" // for proto link
+#include "envoy/service/auth/v3/external_auth.pb.h"
+#include "envoy/type/v3/http_status.pb.h"
 
+#include "common/grpc/common.h"
 #include "common/http/headers.h"
 #include "common/protobuf/protobuf.h"
 
@@ -14,6 +17,7 @@
 #include "gtest/gtest.h"
 
 using testing::_;
+using testing::Eq;
 using testing::Invoke;
 using testing::Ref;
 using testing::Return;
@@ -35,20 +39,20 @@ public:
 
   void initialize(bool use_alpha) {
     use_alpha_ = use_alpha;
-    client_ =
-        std::make_unique<GrpcClientImpl>(Grpc::AsyncClientPtr{async_client_}, timeout_, use_alpha_);
+    client_ = std::make_unique<GrpcClientImpl>(Grpc::RawAsyncClientPtr{async_client_}, timeout_,
+                                               use_alpha_);
   }
 
-  void expectCallSend(envoy::service::auth::v2::CheckRequest& request) {
-    EXPECT_CALL(*async_client_, send(_, ProtoEq(request), Ref(*(client_.get())), _, _))
-        .WillOnce(Invoke(
-            [this](
-                const Protobuf::MethodDescriptor& service_method, const Protobuf::Message&,
-                Grpc::AsyncRequestCallbacks&, Tracing::Span&,
-                const absl::optional<std::chrono::milliseconds>& timeout) -> Grpc::AsyncRequest* {
-              EXPECT_EQ(use_alpha_ ? V2Alpha : V2, service_method.service()->full_name());
-              EXPECT_EQ("Check", service_method.name());
-              EXPECT_EQ(timeout_->count(), timeout->count());
+  void expectCallSend(envoy::service::auth::v3::CheckRequest& request) {
+    EXPECT_CALL(*async_client_,
+                sendRaw(_, _, Grpc::ProtoBufferEq(request), Ref(*(client_.get())), _, _))
+        .WillOnce(
+            Invoke([this](absl::string_view service_full_name, absl::string_view method_name,
+                          Buffer::InstancePtr&&, Grpc::RawAsyncRequestCallbacks&, Tracing::Span&,
+                          const Http::AsyncClient::RequestOptions& options) -> Grpc::AsyncRequest* {
+              EXPECT_EQ(use_alpha_ ? V2Alpha : V2, service_full_name);
+              EXPECT_EQ("Check", method_name);
+              EXPECT_EQ(timeout_->count(), options.timeout->count());
               return &async_request_;
             }));
   }
@@ -68,20 +72,20 @@ INSTANTIATE_TEST_SUITE_P(Parameterized, ExtAuthzGrpcClientTest, Values(true, fal
 TEST_P(ExtAuthzGrpcClientTest, AuthorizationOk) {
   initialize(GetParam());
 
-  auto check_response = std::make_unique<envoy::service::auth::v2::CheckResponse>();
+  auto check_response = std::make_unique<envoy::service::auth::v3::CheckResponse>();
   auto status = check_response->mutable_status();
-  status->set_code(Grpc::Status::GrpcStatus::Ok);
+  status->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
   auto authz_response = Response{};
   authz_response.status = CheckStatus::OK;
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
-  Http::HeaderMapImpl headers;
+  Http::RequestHeaderMapImpl headers;
   client_->onCreateInitialMetadata(headers);
 
-  EXPECT_CALL(span_, setTag("ext_authz_status", "ext_authz_ok"));
+  EXPECT_CALL(span_, setTag(Eq("ext_authz_status"), Eq("ext_authz_ok")));
   EXPECT_CALL(request_callbacks_, onComplete_(WhenDynamicCastTo<ResponsePtr&>(
                                       AuthzResponseNoAttributes(authz_response))));
   client_->onSuccess(std::move(check_response), span_);
@@ -94,18 +98,18 @@ TEST_P(ExtAuthzGrpcClientTest, AuthorizationOkWithAllAtributes) {
   const std::string empty_body{};
   const auto expected_headers = TestCommon::makeHeaderValueOption({{"foo", "bar", false}});
   auto check_response = TestCommon::makeCheckResponse(
-      Grpc::Status::GrpcStatus::Ok, envoy::type::StatusCode::OK, empty_body, expected_headers);
+      Grpc::Status::WellKnownGrpcStatus::Ok, envoy::type::v3::OK, empty_body, expected_headers);
   auto authz_response =
       TestCommon::makeAuthzResponse(CheckStatus::OK, Http::Code::OK, empty_body, expected_headers);
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
-  Http::HeaderMapImpl headers;
+  Http::RequestHeaderMapImpl headers;
   client_->onCreateInitialMetadata(headers);
 
-  EXPECT_CALL(span_, setTag("ext_authz_status", "ext_authz_ok"));
+  EXPECT_CALL(span_, setTag(Eq("ext_authz_status"), Eq("ext_authz_ok")));
   EXPECT_CALL(request_callbacks_,
               onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzOkResponse(authz_response))));
   client_->onSuccess(std::move(check_response), span_);
@@ -115,20 +119,44 @@ TEST_P(ExtAuthzGrpcClientTest, AuthorizationOkWithAllAtributes) {
 TEST_P(ExtAuthzGrpcClientTest, AuthorizationDenied) {
   initialize(GetParam());
 
-  auto check_response = std::make_unique<envoy::service::auth::v2::CheckResponse>();
+  auto check_response = std::make_unique<envoy::service::auth::v3::CheckResponse>();
   auto status = check_response->mutable_status();
-  status->set_code(Grpc::Status::GrpcStatus::PermissionDenied);
+  status->set_code(Grpc::Status::WellKnownGrpcStatus::PermissionDenied);
   auto authz_response = Response{};
   authz_response.status = CheckStatus::Denied;
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
-  Http::HeaderMapImpl headers;
+  Http::RequestHeaderMapImpl headers;
   client_->onCreateInitialMetadata(headers);
   EXPECT_EQ(nullptr, headers.RequestId());
-  EXPECT_CALL(span_, setTag("ext_authz_status", "ext_authz_unauthorized"));
+  EXPECT_CALL(span_, setTag(Eq("ext_authz_status"), Eq("ext_authz_unauthorized")));
+  EXPECT_CALL(request_callbacks_, onComplete_(WhenDynamicCastTo<ResponsePtr&>(
+                                      AuthzResponseNoAttributes(authz_response))));
+
+  client_->onSuccess(std::move(check_response), span_);
+}
+
+// Test the client when a gRPC status code unknown is received from the authorization server.
+TEST_P(ExtAuthzGrpcClientTest, AuthorizationDeniedGrpcUnknownStatus) {
+  initialize(GetParam());
+
+  auto check_response = std::make_unique<envoy::service::auth::v3::CheckResponse>();
+  auto status = check_response->mutable_status();
+  status->set_code(Grpc::Status::WellKnownGrpcStatus::Unknown);
+  auto authz_response = Response{};
+  authz_response.status = CheckStatus::Denied;
+
+  envoy::service::auth::v3::CheckRequest request;
+  expectCallSend(request);
+  client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
+
+  Http::RequestHeaderMapImpl headers;
+  client_->onCreateInitialMetadata(headers);
+  EXPECT_EQ(nullptr, headers.RequestId());
+  EXPECT_CALL(span_, setTag(Eq("ext_authz_status"), Eq("ext_authz_unauthorized")));
   EXPECT_CALL(request_callbacks_, onComplete_(WhenDynamicCastTo<ResponsePtr&>(
                                       AuthzResponseNoAttributes(authz_response))));
 
@@ -142,20 +170,20 @@ TEST_P(ExtAuthzGrpcClientTest, AuthorizationDeniedWithAllAttributes) {
   const std::string expected_body{"test"};
   const auto expected_headers =
       TestCommon::makeHeaderValueOption({{"foo", "bar", false}, {"foobar", "bar", true}});
-  auto check_response = TestCommon::makeCheckResponse(Grpc::Status::GrpcStatus::PermissionDenied,
-                                                      envoy::type::StatusCode::Unauthorized,
-                                                      expected_body, expected_headers);
+  auto check_response =
+      TestCommon::makeCheckResponse(Grpc::Status::WellKnownGrpcStatus::PermissionDenied,
+                                    envoy::type::v3::Unauthorized, expected_body, expected_headers);
   auto authz_response = TestCommon::makeAuthzResponse(CheckStatus::Denied, Http::Code::Unauthorized,
                                                       expected_body, expected_headers);
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
-  Http::HeaderMapImpl headers;
+  Http::RequestHeaderMapImpl headers;
   client_->onCreateInitialMetadata(headers);
   EXPECT_EQ(nullptr, headers.RequestId());
-  EXPECT_CALL(span_, setTag("ext_authz_status", "ext_authz_unauthorized"));
+  EXPECT_CALL(span_, setTag(Eq("ext_authz_status"), Eq("ext_authz_unauthorized")));
   EXPECT_CALL(request_callbacks_,
               onComplete_(WhenDynamicCastTo<ResponsePtr&>(AuthzDeniedResponse(authz_response))));
 
@@ -166,7 +194,7 @@ TEST_P(ExtAuthzGrpcClientTest, AuthorizationDeniedWithAllAttributes) {
 TEST_P(ExtAuthzGrpcClientTest, UnknownError) {
   initialize(GetParam());
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
@@ -179,8 +207,8 @@ TEST_P(ExtAuthzGrpcClientTest, UnknownError) {
 TEST_P(ExtAuthzGrpcClientTest, CancelledAuthorizationRequest) {
   initialize(GetParam());
 
-  envoy::service::auth::v2::CheckRequest request;
-  EXPECT_CALL(*async_client_, send(_, _, _, _, _)).WillOnce(Return(&async_request_));
+  envoy::service::auth::v3::CheckRequest request;
+  EXPECT_CALL(*async_client_, sendRaw(_, _, _, _, _, _)).WillOnce(Return(&async_request_));
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 
   EXPECT_CALL(async_request_, cancel());
@@ -191,7 +219,7 @@ TEST_P(ExtAuthzGrpcClientTest, CancelledAuthorizationRequest) {
 TEST_P(ExtAuthzGrpcClientTest, AuthorizationRequestTimeout) {
   initialize(GetParam());
 
-  envoy::service::auth::v2::CheckRequest request;
+  envoy::service::auth::v3::CheckRequest request;
   expectCallSend(request);
   client_->check(request_callbacks_, request, Tracing::NullSpan::instance());
 

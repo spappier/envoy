@@ -28,7 +28,7 @@ public:
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher()),
         no_exit_timer_(dispatcher_->createTimer([]() -> void {})),
         worker_(tls_, hooks_, std::move(dispatcher_), Network::ConnectionHandlerPtr{handler_},
-                overload_manager_, *api_) {
+                overload_manager_, *api_, "worker_test") {
     // In the real worker the watchdog has timers that prevent exit. Here we need to prevent event
     // loop exit since we use mock timers.
     no_exit_timer_->enableTimer(std::chrono::hours(1));
@@ -47,7 +47,7 @@ public:
   NiceMock<MockOverloadManager> overload_manager_;
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
-  DefaultTestHooks hooks_;
+  DefaultListenerHooks hooks_;
   Event::TimerPtr no_exit_timer_;
   WorkerImpl worker_;
 };
@@ -71,7 +71,9 @@ TEST_F(WorkerImplTest, BasicFlow) {
     ci.setReady();
   });
 
+  NiceMock<Stats::MockStore> store;
   worker_.start(guard_dog_);
+  worker_.initializeStats(store, "test");
   ci.waitReady();
 
   // After a worker is started adding/stopping/removing a listener happens on the worker thread.
@@ -93,8 +95,15 @@ TEST_F(WorkerImplTest, BasicFlow) {
         EXPECT_NE(current_thread_id, std::this_thread::get_id());
         ci.setReady();
       }));
-  worker_.stopListener(listener2);
+
+  ConditionalInitializer ci2;
+  // Verify that callback is called from the other thread.
+  worker_.stopListener(listener2, [current_thread_id, &ci2]() {
+    EXPECT_NE(current_thread_id, std::this_thread::get_id());
+    ci2.setReady();
+  });
   ci.waitReady();
+  ci2.waitReady();
 
   EXPECT_CALL(*handler_, removeListeners(2))
       .WillOnce(InvokeWithoutArgs([current_thread_id]() -> void {
