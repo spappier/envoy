@@ -7,14 +7,17 @@
 #include "gtest/gtest.h"
 
 using testing::_;
-using testing::Return;
+using testing::Invoke;
 
 namespace Envoy {
 namespace Api {
 
-MockApi::MockApi() { ON_CALL(*this, fileSystem()).WillByDefault(ReturnRef(file_system_)); }
+MockApi::MockApi() {
+  ON_CALL(*this, fileSystem()).WillByDefault(ReturnRef(file_system_));
+  ON_CALL(*this, rootScope()).WillByDefault(ReturnRef(stats_store_));
+}
 
-MockApi::~MockApi() {}
+MockApi::~MockApi() = default;
 
 Event::DispatcherPtr MockApi::allocateDispatcher() {
   return Event::DispatcherPtr{allocateDispatcher_(time_system_)};
@@ -23,12 +26,17 @@ Event::DispatcherPtr MockApi::allocateDispatcher(Buffer::WatermarkFactoryPtr&& w
   return Event::DispatcherPtr{allocateDispatcher_(std::move(watermark_factory), time_system_)};
 }
 
-MockOsSysCalls::MockOsSysCalls() {}
+MockOsSysCalls::MockOsSysCalls() {
+  ON_CALL(*this, close(_)).WillByDefault(Invoke([](os_fd_t fd) {
+    const int rc = ::close(fd);
+    return SysCallIntResult{rc, errno};
+  }));
+}
 
-MockOsSysCalls::~MockOsSysCalls() {}
+MockOsSysCalls::~MockOsSysCalls() = default;
 
-SysCallIntResult MockOsSysCalls::setsockopt(int sockfd, int level, int optname, const void* optval,
-                                            socklen_t optlen) {
+SysCallIntResult MockOsSysCalls::setsockopt(os_fd_t sockfd, int level, int optname,
+                                            const void* optval, socklen_t optlen) {
   ASSERT(optlen == sizeof(int));
 
   // Allow mocking system call failure.
@@ -40,7 +48,7 @@ SysCallIntResult MockOsSysCalls::setsockopt(int sockfd, int level, int optname, 
   return SysCallIntResult{0, 0};
 };
 
-SysCallIntResult MockOsSysCalls::getsockopt(int sockfd, int level, int optname, void* optval,
+SysCallIntResult MockOsSysCalls::getsockopt(os_fd_t sockfd, int level, int optname, void* optval,
                                             socklen_t* optlen) {
   ASSERT(*optlen == sizeof(int));
   int val = 0;

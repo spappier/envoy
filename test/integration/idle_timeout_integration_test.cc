@@ -1,5 +1,10 @@
+#include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+
 #include "test/integration/http_protocol_integration.h"
 #include "test/test_common/test_time.h"
+
+using testing::HasSubstr;
 
 namespace Envoy {
 namespace {
@@ -7,9 +12,10 @@ namespace {
 class IdleTimeoutIntegrationTest : public HttpProtocolIntegrationTest {
 public:
   void initialize() override {
+    useAccessLog("%RESPONSE_CODE_DETAILS%");
     config_helper_.addConfigModifier(
-        [&](envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager& hcm)
-            -> void {
+        [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+                hcm) -> void {
           if (enable_global_idle_timeout_) {
             hcm.mutable_stream_idle_timeout()->set_seconds(0);
             hcm.mutable_stream_idle_timeout()->set_nanos(IdleTimeoutMs * 1000 * 1000);
@@ -37,10 +43,10 @@ public:
     fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
     codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
     auto encoder_decoder =
-        codec_client_->startRequest(Http::TestHeaderMapImpl{{":method", method},
-                                                            {":path", "/test/long/url"},
-                                                            {":scheme", "http"},
-                                                            {":authority", "host"}});
+        codec_client_->startRequest(Http::TestRequestHeaderMapImpl{{":method", method},
+                                                                   {":path", "/test/long/url"},
+                                                                   {":scheme", "http"},
+                                                                   {":authority", "host"}});
     request_encoder_ = &encoder_decoder.first;
     auto response = std::move(encoder_decoder.second);
     AssertionResult result =
@@ -70,8 +76,8 @@ public:
 
   // TODO(htuch): This might require scaling for TSAN/ASAN/Valgrind/etc. Bump if
   // this is the cause of flakes.
-  static constexpr uint64_t IdleTimeoutMs = 200;
-  static constexpr uint64_t RequestTimeoutMs = 100;
+  static constexpr uint64_t IdleTimeoutMs = 400;
+  static constexpr uint64_t RequestTimeoutMs = 200;
   bool enable_global_idle_timeout_{false};
   bool enable_per_stream_idle_timeout_{false};
   bool enable_request_timeout_{false};
@@ -85,7 +91,7 @@ INSTANTIATE_TEST_SUITE_P(Protocols, IdleTimeoutIntegrationTest,
 // Tests idle timeout behaviour with single request and validates that idle timer kicks in
 // after given timeout.
 TEST_P(IdleTimeoutIntegrationTest, TimeoutBasic) {
-  config_helper_.addConfigModifier([](envoy::config::bootstrap::v2::Bootstrap& bootstrap) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
     auto* static_resources = bootstrap.mutable_static_resources();
     auto* cluster = static_resources->mutable_clusters(0);
     auto* http_protocol_options = cluster->mutable_common_http_protocol_options();
@@ -117,7 +123,7 @@ TEST_P(IdleTimeoutIntegrationTest, TimeoutBasic) {
 // Tests idle timeout behaviour with multiple requests and validates that idle timer kicks in
 // after both the requests are done.
 TEST_P(IdleTimeoutIntegrationTest, IdleTimeoutWithTwoRequests) {
-  config_helper_.addConfigModifier([](envoy::config::bootstrap::v2::Bootstrap& bootstrap) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
     auto* static_resources = bootstrap.mutable_static_resources();
     auto* cluster = static_resources->mutable_clusters(0);
     auto* http_protocol_options = cluster->mutable_common_http_protocol_options();
@@ -170,8 +176,10 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterDownstreamHeaders) {
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_EQ("stream timeout", response->body());
+
+  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("stream_idle_timeout"));
 }
 
 // Per-stream idle timeout after having sent downstream head request.
@@ -183,9 +191,9 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutHeadRequestAfterDownstrea
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
-  EXPECT_STREQ(fmt::format("{}", strlen("stream timeout")).c_str(),
-               response->headers().ContentLength()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
+  EXPECT_EQ(fmt::format("{}", strlen("stream timeout")),
+            response->headers().ContentLength()->value().getStringView());
   EXPECT_EQ("", response->body());
 }
 
@@ -200,7 +208,7 @@ TEST_P(IdleTimeoutIntegrationTest, GlobalPerStreamIdleTimeoutAfterDownstreamHead
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_EQ("stream timeout", response->body());
 }
 
@@ -217,7 +225,7 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterDownstreamHeadersAnd
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(1U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_EQ("stream timeout", response->body());
 }
 
@@ -226,14 +234,14 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterUpstreamHeaders) {
   enable_per_stream_idle_timeout_ = true;
   auto response = setupPerStreamIdleTimeoutTest();
 
-  upstream_request_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, false);
 
   waitForTimeout(*response, "downstream_rq_idle_timeout");
 
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_FALSE(response->complete());
-  EXPECT_STREQ("200", response->headers().Status()->value().c_str());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
   EXPECT_EQ("", response->body());
 }
 
@@ -243,10 +251,10 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterBidiData) {
   auto response = setupPerStreamIdleTimeoutTest();
 
   sleep();
-  upstream_request_->encode100ContinueHeaders(Http::TestHeaderMapImpl{{":status", "100"}});
+  upstream_request_->encode100ContinueHeaders(Http::TestResponseHeaderMapImpl{{":status", "100"}});
 
   sleep();
-  upstream_request_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, false);
 
   sleep();
   upstream_request_->encodeData(1, false);
@@ -255,7 +263,8 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterBidiData) {
   codec_client_->sendData(*request_encoder_, 1, false);
 
   sleep();
-  Http::TestHeaderMapImpl request_trailers{{"request1", "trailer1"}, {"request2", "trailer2"}};
+  Http::TestRequestTrailerMapImpl request_trailers{{"request1", "trailer1"},
+                                                   {"request2", "trailer2"}};
   codec_client_->sendTrailers(*request_encoder_, request_trailers);
 
   sleep();
@@ -266,7 +275,7 @@ TEST_P(IdleTimeoutIntegrationTest, PerStreamIdleTimeoutAfterBidiData) {
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_EQ(1U, upstream_request_->bodyLength());
   EXPECT_FALSE(response->complete());
-  EXPECT_STREQ("200", response->headers().Status()->value().c_str());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
   EXPECT_EQ("aa", response->body());
 }
 
@@ -296,7 +305,7 @@ TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutTriggersOnBodilessPost) {
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_EQ("request timeout", response->body());
 }
 
@@ -312,12 +321,12 @@ TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutUnconfiguredDoesNotTriggerOnBod
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_NE("request timeout", response->body());
 }
 
 TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutTriggersOnRawIncompleteRequestWithHeaders) {
-  // Omitting \r\n\n\n does not indicate incomplete request in HTTP2
+  // Omitting \r\n\r\n does not indicate incomplete request in HTTP2
   if (downstreamProtocol() == Envoy::Http::CodecClient::Type::HTTP2) {
     return;
   }
@@ -341,7 +350,7 @@ TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutDoesNotTriggerOnRawCompleteRequ
   fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
 
   std::string raw_response;
-  sendRawHttpAndWaitForResponse(lookupPort("http"), "GET / HTTP/1.1\r\n\n\n", &raw_response, true);
+  sendRawHttpAndWaitForResponse(lookupPort("http"), "GET / HTTP/1.1\r\n\r\n", &raw_response, true);
   EXPECT_THAT(raw_response, testing::Not(testing::HasSubstr("request timeout")));
 }
 
@@ -350,7 +359,7 @@ TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutIsDisarmedByPrematureEncodeHead
   enable_per_stream_idle_timeout_ = true;
 
   auto response = setupPerStreamIdleTimeoutTest("POST");
-  upstream_request_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, false);
 
   waitForTimeout(*response);
 
@@ -363,14 +372,14 @@ TEST_P(IdleTimeoutIntegrationTest, RequestTimeoutIsNotDisarmedByEncode100Continu
   enable_request_timeout_ = true;
 
   auto response = setupPerStreamIdleTimeoutTest("POST");
-  upstream_request_->encode100ContinueHeaders(Http::TestHeaderMapImpl{{":status", "100"}});
+  upstream_request_->encode100ContinueHeaders(Http::TestResponseHeaderMapImpl{{":status", "100"}});
 
   waitForTimeout(*response, "downstream_rq_timeout");
 
   EXPECT_FALSE(upstream_request_->complete());
   EXPECT_EQ(0U, upstream_request_->bodyLength());
   EXPECT_TRUE(response->complete());
-  EXPECT_STREQ("408", response->headers().Status()->value().c_str());
+  EXPECT_EQ("408", response->headers().Status()->value().getStringView());
   EXPECT_EQ("request timeout", response->body());
 }
 
