@@ -300,11 +300,11 @@ void HdsCluster::update(const envoy::config::cluster::v3::Cluster& cluster) {
   std::unordered_set<std::string> existing_hosts(hosts_->size());
 
   for (const auto& lb_endpoint : cluster.load_assignment().endpoints(0).lb_endpoints()) {
-    const HostSharedPtr& host = HostSharedPtr{
-        new HostImpl(info_, "", Network::Address::resolveProtoAddress(lb_endpoint.endpoint().address()),
-                     nullptr, 1, envoy::config::core::v3::Locality().default_instance(),
-                     envoy::config::endpoint::v3::Endpoint::HealthCheckConfig().default_instance(),
-                     0, envoy::config::core::v3::UNKNOWN)};
+    const HostSharedPtr& host = HostSharedPtr{new HostImpl(
+        info_, "", Network::Address::resolveProtoAddress(lb_endpoint.endpoint().address()), nullptr,
+        1, envoy::config::core::v3::Locality().default_instance(),
+        envoy::config::endpoint::v3::Endpoint::HealthCheckConfig().default_instance(), 0,
+        envoy::config::core::v3::UNKNOWN)};
 
     host->healthFlagSet(Host::HealthFlag::FAILED_ACTIVE_HC);
 
