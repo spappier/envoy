@@ -11,13 +11,17 @@
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.validate.h"
 #include "envoy/http/filter.h"
+#include "envoy/http/request_id_extension.h"
 #include "envoy/router/route_config_provider_manager.h"
 #include "envoy/tracing/http_tracer_manager.h"
 
 #include "common/common/logger.h"
 #include "common/http/conn_manager_impl.h"
 #include "common/http/date_provider_impl.h"
+#include "common/http/http1/codec_stats.h"
+#include "common/http/http2/codec_stats.h"
 #include "common/json/json_loader.h"
+#include "common/local_reply/local_reply.h"
 #include "common/router/rds_impl.h"
 #include "common/router/scoped_rds.h"
 #include "common/tracing/http_tracer_impl.h"
@@ -98,6 +102,7 @@ public:
                                 Http::FilterChainFactoryCallbacks& callbacks) override;
 
   // Http::ConnectionManagerConfig
+  Http::RequestIDExtensionSharedPtr requestIDExtension() override { return request_id_extension_; }
   const std::list<AccessLog::InstanceSharedPtr>& accessLogs() override { return access_logs_; }
   Http::ServerConnectionPtr createCodec(Network::Connection& connection,
                                         const Buffer::Instance& data,
@@ -107,6 +112,7 @@ public:
   FilterChainFactory& filterFactory() override { return *this; }
   bool generateRequestId() const override { return generate_request_id_; }
   bool preserveExternalRequestId() const override { return preserve_external_request_id_; }
+  bool alwaysSetRequestIdInResponse() const override { return always_set_request_id_in_response_; }
   uint32_t maxRequestHeadersKb() const override { return max_request_headers_kb_; }
   uint32_t maxRequestHeadersCount() const override { return max_request_headers_count_; }
   absl::optional<std::chrono::milliseconds> idleTimeout() const override { return idle_timeout_; }
@@ -154,7 +160,13 @@ public:
   const Http::Http1Settings& http1Settings() const override { return http1_settings_; }
   bool shouldNormalizePath() const override { return normalize_path_; }
   bool shouldMergeSlashes() const override { return merge_slashes_; }
+  bool shouldStripMatchingPort() const override { return strip_matching_port_; }
+  envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+  headersWithUnderscoresAction() const override {
+    return headers_with_underscores_action_;
+  }
   std::chrono::milliseconds delayedCloseTimeout() const override { return delayed_close_timeout_; }
+  const LocalReply::LocalReply& localReply() const override { return *local_reply_; }
 
 private:
   enum class CodecType { HTTP1, HTTP2, HTTP3, AUTO };
@@ -172,12 +184,15 @@ private:
       const envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
           filter_config);
 
+  Http::RequestIDExtensionSharedPtr request_id_extension_;
   Server::Configuration::FactoryContext& context_;
   FilterFactoriesList filter_factories_;
   std::map<std::string, FilterConfig> upgrade_filter_factories_;
   std::list<AccessLog::InstanceSharedPtr> access_logs_;
   const std::string stats_prefix_;
   Http::ConnectionManagerStats stats_;
+  mutable Http::Http1::CodecStats::AtomicPtr http1_codec_stats_;
+  mutable Http::Http2::CodecStats::AtomicPtr http2_codec_stats_;
   Http::ConnectionManagerTracingStats tracing_stats_;
   const bool use_remote_address_{};
   const std::unique_ptr<Http::InternalAddressConfig> internal_address_config_;
@@ -209,12 +224,17 @@ private:
   std::chrono::milliseconds drain_timeout_;
   bool generate_request_id_;
   const bool preserve_external_request_id_;
+  const bool always_set_request_id_in_response_;
   Http::DateProvider& date_provider_;
   Http::ConnectionManagerListenerStats listener_stats_;
   const bool proxy_100_continue_;
   std::chrono::milliseconds delayed_close_timeout_;
   const bool normalize_path_;
   const bool merge_slashes_;
+  const bool strip_matching_port_;
+  const envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+      headers_with_underscores_action_;
+  const LocalReply::LocalReplyPtr local_reply_;
 
   // Default idle timeout is 5 minutes if nothing is specified in the HCM config.
   static const uint64_t StreamIdleTimeoutMs = 5 * 60 * 1000;

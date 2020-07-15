@@ -46,7 +46,7 @@ public:
                                    ->mutable_transport_socket();
       envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
       auto* common_tls_context = tls_context.mutable_common_tls_context();
-      common_tls_context->add_alpn_protocols("http/1.1");
+      common_tls_context->add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
 
       common_tls_context->mutable_validation_context_sds_secret_config()->set_name(
           "validation_context");
@@ -104,7 +104,7 @@ TEST_P(SdsStaticDownstreamIntegrationTest, RouterRequestAndResponseWithGiantBody
   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
     return makeSslClientConnection();
   };
-  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, &creator);
+  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, false, &creator);
 }
 
 class SdsStaticUpstreamIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
@@ -160,7 +160,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, SdsStaticUpstreamIntegrationTest,
                          TestUtility::ipTestParamsToString);
 
 TEST_P(SdsStaticUpstreamIntegrationTest, RouterRequestAndResponseWithGiantBodyBuffer) {
-  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, nullptr);
+  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, false, nullptr);
 }
 
 } // namespace Ssl

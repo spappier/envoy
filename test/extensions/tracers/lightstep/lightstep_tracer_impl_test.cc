@@ -3,7 +3,7 @@
 #include <sstream>
 #include <string>
 
-#include "envoy/config/trace/v3/trace.pb.h"
+#include "envoy/config/trace/v3/lightstep.pb.h"
 
 #include "common/common/base64.h"
 #include "common/grpc/common.h"
@@ -11,7 +11,6 @@
 #include "common/http/headers.h"
 #include "common/http/message_impl.h"
 #include "common/runtime/runtime_impl.h"
-#include "common/runtime/uuid_util.h"
 #include "common/stats/fake_symbol_table_impl.h"
 #include "common/tracing/http_tracer_impl.h"
 
@@ -33,11 +32,13 @@
 
 using testing::_;
 using testing::AtLeast;
+using testing::DoAll;
 using testing::Eq;
 using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
 using testing::ReturnRef;
+using testing::WithArg;
 
 namespace Envoy {
 namespace Extensions {
@@ -71,6 +72,7 @@ public:
     opts->access_token = "sample_token";
     opts->component_name = "component";
 
+    cm_.thread_local_cluster_.cluster_.info_->name_ = "fake_cluster";
     ON_CALL(cm_, httpAsyncClientForCluster("fake_cluster"))
         .WillByDefault(ReturnRef(cm_.async_client_));
 
@@ -187,6 +189,47 @@ TEST_F(LightStepDriverTest, InitializeDriver) {
   }
 }
 
+TEST_F(LightStepDriverTest, DeferredTlsInitialization) {
+  EXPECT_CALL(cm_, get(Eq("fake_cluster"))).WillRepeatedly(Return(&cm_.thread_local_cluster_));
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillByDefault(Return(Upstream::ClusterInfo::Features::HTTP2));
+
+  const std::string yaml_string = R"EOF(
+    collector_cluster: fake_cluster
+    )EOF";
+  envoy::config::trace::v3::LightstepConfig lightstep_config;
+  TestUtility::loadFromYaml(yaml_string, lightstep_config);
+
+  std::unique_ptr<lightstep::LightStepTracerOptions> opts(new lightstep::LightStepTracerOptions());
+  opts->access_token = "sample_token";
+  opts->component_name = "component";
+
+  ON_CALL(cm_, httpAsyncClientForCluster("fake_cluster"))
+      .WillByDefault(ReturnRef(cm_.async_client_));
+
+  auto propagation_mode = Common::Ot::OpenTracingDriver::PropagationMode::TracerNative;
+
+  tls_.defer_data = true;
+  driver_ = std::make_unique<LightStepDriver>(lightstep_config, cm_, stats_, tls_, runtime_,
+                                              std::move(opts), propagation_mode, grpc_context_);
+  tls_.call();
+}
+
+TEST_F(LightStepDriverTest, AllowCollectorClusterToBeAddedViaApi) {
+  EXPECT_CALL(cm_, get(Eq("fake_cluster"))).WillRepeatedly(Return(&cm_.thread_local_cluster_));
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillByDefault(Return(Upstream::ClusterInfo::Features::HTTP2));
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, addedViaApi()).WillByDefault(Return(true));
+
+  const std::string yaml_string = R"EOF(
+  collector_cluster: fake_cluster
+  )EOF";
+  envoy::config::trace::v3::LightstepConfig lightstep_config;
+  TestUtility::loadFromYaml(yaml_string, lightstep_config);
+
+  setup(lightstep_config, true);
+}
+
 TEST_F(LightStepDriverTest, FlushSeveralSpans) {
   setupValidDriver(2);
 
@@ -202,10 +245,9 @@ TEST_F(LightStepDriverTest, FlushSeveralSpans) {
             callback = &callbacks;
 
             EXPECT_EQ("/lightstep.collector.CollectorService/Report",
-                      message->headers().Path()->value().getStringView());
-            EXPECT_EQ("fake_cluster", message->headers().Host()->value().getStringView());
-            EXPECT_EQ("application/grpc",
-                      message->headers().ContentType()->value().getStringView());
+                      message->headers().getPathValue());
+            EXPECT_EQ("fake_cluster", message->headers().getHostValue());
+            EXPECT_EQ("application/grpc", message->headers().getContentTypeValue());
 
             return &request;
           }));
@@ -239,6 +281,123 @@ TEST_F(LightStepDriverTest, FlushSeveralSpans) {
                     .counter("grpc.lightstep.collector.CollectorService.Report.total")
                     .value());
   EXPECT_EQ(2U, stats_.counter("tracing.lightstep.spans_sent").value());
+  EXPECT_EQ(0U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
+}
+
+TEST_F(LightStepDriverTest, SkipReportIfCollectorClusterHasBeenRemoved) {
+  Upstream::ClusterUpdateCallbacks* cluster_update_callbacks;
+  EXPECT_CALL(cm_, addThreadLocalClusterUpdateCallbacks_(_))
+      .WillOnce(DoAll(SaveArgAddress(&cluster_update_callbacks), Return(nullptr)));
+
+  setupValidDriver(1);
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("tracing.lightstep.request_timeout", 5000U))
+      .WillRepeatedly(Return(5000U));
+
+  // Verify the effect of onClusterAddOrUpdate()/onClusterRemoval() on reporting logic,
+  // keeping in mind that they will be called both for relevant and irrelevant clusters.
+
+  {
+    // Simulate removal of the relevant cluster.
+    cluster_update_callbacks->onClusterRemoval("fake_cluster");
+
+    // Verify that no report will be sent.
+    EXPECT_CALL(cm_, httpAsyncClientForCluster(_)).Times(0);
+    EXPECT_CALL(cm_.async_client_, send_(_, _, _)).Times(0);
+
+    // Trigger flush of a span.
+    driver_
+        ->startSpan(config_, request_headers_, operation_name_, start_time_,
+                    {Tracing::Reason::Sampling, true})
+        ->finishSpan();
+    driver_->flush();
+
+    // Verify observability.
+    EXPECT_EQ(1U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
+    EXPECT_EQ(0U, stats_.counter("tracing.lightstep.spans_sent").value());
+    EXPECT_EQ(0U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  }
+
+  {
+    // Simulate addition of an irrelevant cluster.
+    NiceMock<Upstream::MockThreadLocalCluster> unrelated_cluster;
+    unrelated_cluster.cluster_.info_->name_ = "unrelated_cluster";
+    cluster_update_callbacks->onClusterAddOrUpdate(unrelated_cluster);
+
+    // Verify that no report will be sent.
+    EXPECT_CALL(cm_, httpAsyncClientForCluster(_)).Times(0);
+    EXPECT_CALL(cm_.async_client_, send_(_, _, _)).Times(0);
+
+    // Trigger flush of a span.
+    driver_
+        ->startSpan(config_, request_headers_, operation_name_, start_time_,
+                    {Tracing::Reason::Sampling, true})
+        ->finishSpan();
+    driver_->flush();
+
+    // Verify observability.
+    EXPECT_EQ(2U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
+    EXPECT_EQ(0U, stats_.counter("tracing.lightstep.spans_sent").value());
+    EXPECT_EQ(0U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  }
+
+  {
+    // Simulate addition of the relevant cluster.
+    cluster_update_callbacks->onClusterAddOrUpdate(cm_.thread_local_cluster_);
+
+    // Verify that report will be sent.
+    EXPECT_CALL(cm_, httpAsyncClientForCluster("fake_cluster"))
+        .WillOnce(ReturnRef(cm_.async_client_));
+    Http::MockAsyncClientRequest request(&cm_.async_client_);
+    Http::AsyncClient::Callbacks* callback{};
+    EXPECT_CALL(cm_.async_client_, send_(_, _, _))
+        .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&callback)), Return(&request)));
+
+    // Trigger flush of a span.
+    driver_
+        ->startSpan(config_, request_headers_, operation_name_, start_time_,
+                    {Tracing::Reason::Sampling, true})
+        ->finishSpan();
+    driver_->flush();
+
+    // Complete in-flight request.
+    callback->onFailure(request, Http::AsyncClient::FailureReason::Reset);
+
+    // Verify observability.
+    EXPECT_EQ(2U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
+    EXPECT_EQ(0U, stats_.counter("tracing.lightstep.spans_sent").value());
+    EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  }
+
+  {
+    // Simulate removal of an irrelevant cluster.
+    cluster_update_callbacks->onClusterRemoval("unrelated_cluster");
+
+    // Verify that report will be sent.
+    EXPECT_CALL(cm_, httpAsyncClientForCluster("fake_cluster"))
+        .WillOnce(ReturnRef(cm_.async_client_));
+    Http::MockAsyncClientRequest request(&cm_.async_client_);
+    Http::AsyncClient::Callbacks* callback{};
+    EXPECT_CALL(cm_.async_client_, send_(_, _, _))
+        .WillOnce(DoAll(WithArg<1>(SaveArgAddress(&callback)), Return(&request)));
+
+    // Trigger flush of a span.
+    driver_
+        ->startSpan(config_, request_headers_, operation_name_, start_time_,
+                    {Tracing::Reason::Sampling, true})
+        ->finishSpan();
+    driver_->flush();
+
+    // Complete in-flight request.
+    Http::ResponseMessagePtr msg(new Http::ResponseMessageImpl(
+        Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
+    callback->onSuccess(request, std::move(msg));
+
+    // Verify observability.
+    EXPECT_EQ(2U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
+    EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_sent").value());
+    EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  }
 }
 
 TEST_F(LightStepDriverTest, FlushOneFailure) {
@@ -256,10 +415,9 @@ TEST_F(LightStepDriverTest, FlushOneFailure) {
             callback = &callbacks;
 
             EXPECT_EQ("/lightstep.collector.CollectorService/Report",
-                      message->headers().Path()->value().getStringView());
-            EXPECT_EQ("fake_cluster", message->headers().Host()->value().getStringView());
-            EXPECT_EQ("application/grpc",
-                      message->headers().ContentType()->value().getStringView());
+                      message->headers().getPathValue());
+            EXPECT_EQ("fake_cluster", message->headers().getHostValue());
+            EXPECT_EQ("application/grpc", message->headers().getContentTypeValue());
 
             return &request;
           }));
@@ -286,6 +444,7 @@ TEST_F(LightStepDriverTest, FlushOneFailure) {
                     .counter("grpc.lightstep.collector.CollectorService.Report.total")
                     .value());
   EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  EXPECT_EQ(0U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
 }
 
 TEST_F(LightStepDriverTest, FlushWithActiveReport) {
@@ -303,10 +462,9 @@ TEST_F(LightStepDriverTest, FlushWithActiveReport) {
             callback = &callbacks;
 
             EXPECT_EQ("/lightstep.collector.CollectorService/Report",
-                      message->headers().Path()->value().getStringView());
-            EXPECT_EQ("fake_cluster", message->headers().Host()->value().getStringView());
-            EXPECT_EQ("application/grpc",
-                      message->headers().ContentType()->value().getStringView());
+                      message->headers().getPathValue());
+            EXPECT_EQ("fake_cluster", message->headers().getHostValue());
+            EXPECT_EQ("application/grpc", message->headers().getContentTypeValue());
 
             return &request;
           }));
@@ -327,6 +485,7 @@ TEST_F(LightStepDriverTest, FlushWithActiveReport) {
   driver_->flush();
 
   EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  EXPECT_EQ(0U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
 
   EXPECT_CALL(request, cancel());
 
@@ -348,10 +507,9 @@ TEST_F(LightStepDriverTest, OnFullWithActiveReport) {
             callback = &callbacks;
 
             EXPECT_EQ("/lightstep.collector.CollectorService/Report",
-                      message->headers().Path()->value().getStringView());
-            EXPECT_EQ("fake_cluster", message->headers().Host()->value().getStringView());
-            EXPECT_EQ("application/grpc",
-                      message->headers().ContentType()->value().getStringView());
+                      message->headers().getPathValue());
+            EXPECT_EQ("fake_cluster", message->headers().getHostValue());
+            EXPECT_EQ("application/grpc", message->headers().getContentTypeValue());
 
             return &request;
           }));
@@ -375,6 +533,7 @@ TEST_F(LightStepDriverTest, OnFullWithActiveReport) {
       ->finishSpan();
 
   EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_dropped").value());
+  EXPECT_EQ(0U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
 
   EXPECT_CALL(request, cancel());
 
@@ -415,6 +574,7 @@ TEST_F(LightStepDriverTest, FlushSpansTimer) {
 
   EXPECT_EQ(1U, stats_.counter("tracing.lightstep.timer_flushed").value());
   EXPECT_EQ(1U, stats_.counter("tracing.lightstep.spans_sent").value());
+  EXPECT_EQ(0U, stats_.counter("tracing.lightstep.reports_skipped_no_cluster").value());
 }
 
 TEST_F(LightStepDriverTest, CancelRequestOnDestruction) {
@@ -458,24 +618,24 @@ TEST_F(LightStepDriverTest, SerializeAndDeserializeContext) {
 
     // Supply bogus context, that will be simply ignored.
     const std::string invalid_context = "notvalidcontext";
-    request_headers_.setOtSpanContext(invalid_context);
+    request_headers_.setCopy(Http::CustomHeaders::get().OtSpanContext, invalid_context);
     stats_.counter("tracing.opentracing.span_context_extraction_error").reset();
     driver_->startSpan(config_, request_headers_, operation_name_, start_time_,
                        {Tracing::Reason::Sampling, true});
     EXPECT_EQ(1U, stats_.counter("tracing.opentracing.span_context_extraction_error").value());
 
-    std::string injected_ctx(request_headers_.OtSpanContext()->value().getStringView());
+    std::string injected_ctx(request_headers_.get_(Http::CustomHeaders::get().OtSpanContext));
     EXPECT_FALSE(injected_ctx.empty());
 
     // Supply empty context.
-    request_headers_.removeOtSpanContext();
+    request_headers_.remove(Http::CustomHeaders::get().OtSpanContext);
     Tracing::SpanPtr span = driver_->startSpan(config_, request_headers_, operation_name_,
                                                start_time_, {Tracing::Reason::Sampling, true});
 
-    EXPECT_EQ(nullptr, request_headers_.OtSpanContext());
+    EXPECT_FALSE(request_headers_.has(Http::CustomHeaders::get().OtSpanContext));
     span->injectContext(request_headers_);
 
-    injected_ctx = std::string(request_headers_.OtSpanContext()->value().getStringView());
+    injected_ctx = std::string(request_headers_.get_(Http::CustomHeaders::get().OtSpanContext));
     EXPECT_FALSE(injected_ctx.empty());
 
     // Context can be parsed fine.
@@ -487,11 +647,49 @@ TEST_F(LightStepDriverTest, SerializeAndDeserializeContext) {
     // Supply parent context, request_headers has properly populated x-ot-span-context.
     Tracing::SpanPtr span_with_parent = driver_->startSpan(
         config_, request_headers_, operation_name_, start_time_, {Tracing::Reason::Sampling, true});
-    request_headers_.removeOtSpanContext();
+    request_headers_.remove(Http::CustomHeaders::get().OtSpanContext);
     span_with_parent->injectContext(request_headers_);
-    injected_ctx = std::string(request_headers_.OtSpanContext()->value().getStringView());
+    injected_ctx = std::string(request_headers_.get_(Http::CustomHeaders::get().OtSpanContext));
     EXPECT_FALSE(injected_ctx.empty());
   }
+}
+
+TEST_F(LightStepDriverTest, MultiplePropagationModes) {
+  const std::string yaml_string = R"EOF(
+    collector_cluster: fake_cluster
+    propagation_modes:
+    - ENVOY
+    - LIGHTSTEP
+    - B3
+    - TRACE_CONTEXT
+    )EOF";
+  envoy::config::trace::v3::LightstepConfig lightstep_config;
+  TestUtility::loadFromYaml(yaml_string, lightstep_config);
+
+  EXPECT_CALL(cm_, get(Eq("fake_cluster"))).WillRepeatedly(Return(&cm_.thread_local_cluster_));
+  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillByDefault(Return(Upstream::ClusterInfo::Features::HTTP2));
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("tracing.lightstep.flush_interval_ms", _))
+      .Times(AtLeast(1))
+      .WillRepeatedly(Return(1000));
+
+  EXPECT_CALL(runtime_.snapshot_, getInteger("tracing.lightstep.min_flush_spans",
+                                             LightStepDriver::DefaultMinFlushSpans))
+      .Times(AtLeast(1))
+      .WillRepeatedly(Return(1));
+
+  setup(lightstep_config, true);
+
+  Tracing::SpanPtr span = driver_->startSpan(config_, request_headers_, operation_name_,
+                                             start_time_, {Tracing::Reason::Sampling, true});
+
+  EXPECT_FALSE(request_headers_.has(Http::CustomHeaders::get().OtSpanContext));
+  span->injectContext(request_headers_);
+  EXPECT_TRUE(request_headers_.has(Http::CustomHeaders::get().OtSpanContext));
+  EXPECT_TRUE(request_headers_.has("ot-tracer-traceid"));
+  EXPECT_TRUE(request_headers_.has("x-b3-traceid"));
+  EXPECT_TRUE(request_headers_.has("traceparent"));
 }
 
 TEST_F(LightStepDriverTest, SpawnChild) {
@@ -512,9 +710,9 @@ TEST_F(LightStepDriverTest, SpawnChild) {
   childViaSpawn->injectContext(base2);
 
   std::string base1_context =
-      Base64::decode(std::string(base1.OtSpanContext()->value().getStringView()));
+      Base64::decode(std::string(base1.get_(Http::CustomHeaders::get().OtSpanContext)));
   std::string base2_context =
-      Base64::decode(std::string(base2.OtSpanContext()->value().getStringView()));
+      Base64::decode(std::string(base2.get_(Http::CustomHeaders::get().OtSpanContext)));
 
   EXPECT_FALSE(base1_context.empty());
   EXPECT_FALSE(base2_context.empty());
